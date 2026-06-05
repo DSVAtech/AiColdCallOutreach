@@ -49,6 +49,56 @@ async function createTask(contactId, { title, body, dueDate }) {
   return data;
 }
 
+async function findOpportunityByContact(contactId, pipelineId) {
+  const { data } = await client.get('/opportunities/search', {
+    params: {
+      location_id: config.ghl.locationId,
+      pipeline_id: pipelineId,
+      contact_id: contactId,
+      limit: 1,
+    },
+  });
+  return data?.opportunities?.[0] || null;
+}
+
+async function createOpportunity({ contactId, pipelineId, stageId, name, monetaryValue }) {
+  const { data } = await client.post('/opportunities/', {
+    locationId: config.ghl.locationId,
+    pipelineId,
+    pipelineStageId: stageId,
+    contactId,
+    name: name || 'AI Cold Call Lead',
+    status: 'open',
+    monetaryValue: monetaryValue ?? 0,
+  });
+  return data?.opportunity || data;
+}
+
+async function updateOpportunityStage(opportunityId, stageId, extra = {}) {
+  const { data } = await client.put(`/opportunities/${opportunityId}`, {
+    pipelineStageId: stageId,
+    ...extra,
+  });
+  return data?.opportunity || data;
+}
+
+async function upsertOpportunityStage({ contactId, pipelineId, stageId, name }) {
+  const existing = await findOpportunityByContact(contactId, pipelineId).catch(() => null);
+  if (existing) {
+    return updateOpportunityStage(existing.id, stageId);
+  }
+  try {
+    return await createOpportunity({ contactId, pipelineId, stageId, name });
+  } catch (err) {
+    const existingId = err.response?.data?.meta?.existingId;
+    if (existingId) {
+      console.log(`[ghl] 🔀 opportunity ${existingId} exists in another pipeline — moving it to AI Cold Call pipeline`);
+      return updateOpportunityStage(existingId, stageId, { pipelineId });
+    }
+    throw err;
+  }
+}
+
 module.exports = {
   getContact,
   addNote,
@@ -56,4 +106,8 @@ module.exports = {
   removeTags,
   updateContact,
   createTask,
+  findOpportunityByContact,
+  createOpportunity,
+  updateOpportunityStage,
+  upsertOpportunityStage,
 };

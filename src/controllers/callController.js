@@ -1,6 +1,8 @@
 const ghl = require('../services/ghlService');
 const vapi = require('../services/vapiService');
 const { isWithinCallingHours } = require('../utils/callingHours');
+const { parseDemoTime } = require('../utils/parseDemoTime');
+const { DateTime } = require('luxon');
 const config = require('../config');
 
 function pickPhone(contact) {
@@ -23,9 +25,11 @@ async function triggerCallForContact(contactId) {
     return { skipped: true, reason: 'dnc' };
   }
 
-  if (!contactTags.includes(config.tags.queue)) {
-    console.log(`[call] Skipping ${contactId} - missing queue tag "${config.tags.queue}"`);
-    return { skipped: true, reason: 'not_in_queue', requiredTag: config.tags.queue };
+  const validQueueTags = [config.tags.queue, config.tags.productionQueue].filter(Boolean);
+  const inQueue = validQueueTags.some(t => contactTags.includes(t));
+  if (!inQueue) {
+    console.log(`[call] Skipping ${contactId} - missing any queue tag (${validQueueTags.join(' or ')})`);
+    return { skipped: true, reason: 'not_in_queue', requiredAny: validQueueTags };
   }
 
   const phone = pickPhone(contact);
@@ -45,18 +49,43 @@ async function triggerCallForContact(contactId) {
   });
 
   console.log(`[call] Started VAPI call ${call.id} for contact ${contactId}`);
+
+  if (config.pipeline.id && config.pipeline.stages.outboundDialled) {
+    try {
+      await ghl.upsertOpportunityStage({
+        contactId,
+        pipelineId: config.pipeline.id,
+        stageId: config.pipeline.stages.outboundDialled,
+        name: `Cold Call — ${pickName(contact) || phone}`,
+      });
+      console.log(`[ghl] ✅ opportunity -> Outbound Dialled`);
+    } catch (err) {
+      console.error(`[ghl] ❌ opportunity create FAILED:`, err.response?.data || err.message);
+    }
+  }
+
   return { started: true, callId: call.id };
 }
 
 function extractStructured(vapiReport) {
+  const artifact = vapiReport.artifact || vapiReport.call?.artifact || {};
   const analysis = vapiReport.analysis || vapiReport.call?.analysis || {};
+
+  const soId = config.vapi.structuredOutputId;
+  const artifactOutputs = artifact.structuredOutputs || {};
+  if (soId && artifactOutputs[soId]?.result) {
+    return artifactOutputs[soId].result;
+  }
+  const firstArtifact = Object.values(artifactOutputs)[0];
+  if (firstArtifact?.result) return firstArtifact.result;
+
   if (analysis.structuredData && Object.keys(analysis.structuredData).length) {
     return analysis.structuredData;
   }
-  const outputs = analysis.structuredOutputs || analysis.structuredOutput || {};
-  const first = Object.values(outputs)[0];
-  if (first && typeof first === 'object') {
-    return first.result || first.value || first.data || first;
+  const analysisOutputs = analysis.structuredOutputs || analysis.structuredOutput || {};
+  const firstAnalysis = Object.values(analysisOutputs)[0];
+  if (firstAnalysis && typeof firstAnalysis === 'object') {
+    return firstAnalysis.result || firstAnalysis.value || firstAnalysis.data || firstAnalysis;
   }
   return {};
 }
@@ -67,16 +96,19 @@ function classifyOutcome(vapiReport) {
   const endedReason = vapiReport.endedReason || vapiReport.call?.endedReason || '';
   const summary = (analysis.summary || '').toLowerCase();
 
+  if (structured.demo_booked === true) return 'demo-booked';
   if (structured.outcome) return structured.outcome;
 
   if (structured.dnc === true || /do not call|don't call|stop calling/.test(summary)) return 'dnc';
   if (/no[- ]?answer|voicemail|busy|customer-did-not-answer|not-answered|silence-timed-out|twilio-failed|pipeline-error|failed/i.test(endedReason)) return 'no-answer';
-  if (structured.interested === true || /interested|sign me up|tell me more/.test(summary)) return 'hot-lead';
+  if (structured.demo_booked === true || /demo (is )?(booked|scheduled|set)|appointment (booked|set|scheduled)|booked (a |the )?demo/.test(summary)) return 'demo-booked';
+  if (structured.interested === true || /very interested|sign me up|tell me more|sounds great/.test(summary)) return 'hot-lead';
   if (structured.callback === true || /call ?back|call me later/.test(summary)) return 'callback-requested';
   if (structured.interested === false || /not interested|no thanks/.test(summary)) return 'not-interested';
+  if (/maybe|might be|think about|consider|send (me )?(info|details|email)/.test(summary)) return 'warm-lead';
   if (/enquir|question|ask about/.test(summary)) return 'enquiry-logged';
 
-  return 'enquiry-logged';
+  return 'warm-lead';
 }
 
 function buildNote(vapiReport, outcome) {
@@ -100,13 +132,50 @@ function buildNote(vapiReport, outcome) {
     timeStyle: 'short',
   });
 
+  const isDemo = outcome === 'demo-booked';
+  const isNoAnswer = outcome === 'no-answer';
+  const endedReason = vapiReport.endedReason || vapiReport.call?.endedReason || 'unknown';
+  const rawDemoTime = sd.demo_time || sd.callback_time || '';
+  const parsedDemoIso = isDemo && rawDemoTime ? parseDemoTime(rawDemoTime, startedAt) : null;
+  const parsedDemoPretty = parsedDemoIso
+    ? DateTime.fromISO(parsedDemoIso).setZone('Australia/Sydney').toFormat("ccc d LLL yyyy, h:mm a 'AEST'")
+    : null;
+
+  let header;
+  if (isDemo) header = '🎯 DEMO BOOKED — boss to follow up';
+  else if (isNoAnswer) header = `📵 NO ANSWER — ${dateStr} AEST`;
+  else header = `AI Cold Call — ${dateStr} AEST`;
+
+  if (isNoAnswer) {
+    const reasonPretty = {
+      'customer-did-not-answer': 'Lead did not pick up',
+      'voicemail': 'Went to voicemail',
+      'customer-busy': 'Line was busy',
+      'silence-timed-out': 'Picked up but stayed silent',
+      'twilio-failed': 'Carrier failed to connect',
+      'pipeline-error': 'Technical error before connection',
+    }[endedReason] || `Did not connect (${endedReason})`;
+    const lines = [
+      header,
+      `Outcome: no-answer`,
+      `Reason: ${reasonPretty}`,
+      durationStr ? `Ring duration: ${durationStr}` : null,
+      `Next step: lead remains in queue — will be retried tomorrow.`,
+    ].filter(Boolean);
+    return lines.join('\n');
+  }
+
   const lines = [
-    `AI Cold Call — ${dateStr} AEST`,
+    header,
+    isDemo ? `Call date: ${dateStr} AEST` : null,
     `Outcome: ${outcome}`,
     durationStr ? `Duration: ${durationStr}` : null,
     `Sentiment: ${sd.sentiment || 'n/a'}`,
-    sd.callback_time ? `Callback time: ${sd.callback_time}` : null,
-    sd.best_email ? `Captured email: ${sd.best_email}` : null,
+    isDemo && rawDemoTime ? `Demo requested (lead said): ${rawDemoTime}` : null,
+    isDemo && parsedDemoPretty ? `Demo time (parsed): ${parsedDemoPretty}` : null,
+    isDemo && !parsedDemoPretty && rawDemoTime ? `⚠️ Could not auto-parse demo time — confirm manually` : null,
+    !isDemo && sd.callback_time ? `Callback time: ${sd.callback_time}` : null,
+    `Follow-up: phone only (lead's number on file)`,
     sd.key_enquiries ? `Enquiries: ${sd.key_enquiries}` : null,
     '',
     'Summary:',
@@ -145,6 +214,8 @@ async function handleCallOutcome(vapiReport) {
   const { tags } = config;
   const tagPlan = {
     'hot-lead':           { add: [tags.hotLead],       remove: [tags.queue] },
+    'warm-lead':          { add: ['warm-lead'],        remove: [tags.queue] },
+    'demo-booked':        { add: ['demo-booked', 'awaiting-boss-followup'], remove: [tags.queue] },
     'callback-requested': { add: [tags.callback],      remove: [tags.queue] },
     'not-interested':     { add: [tags.notInterested], remove: [tags.queue] },
     'no-answer':          { add: [tags.noAnswer],      remove: [] },
@@ -169,14 +240,50 @@ async function handleCallOutcome(vapiReport) {
     }
   }
 
-  if (outcome === 'callback-requested') {
+  if (config.pipeline.id) {
+    const stageMap = {
+      'hot-lead':           config.pipeline.stages.hotLead,
+      'warm-lead':          config.pipeline.stages.warmLead,
+      'demo-booked':        config.pipeline.stages.demoBooked,
+      'callback-requested': config.pipeline.stages.warmLead,
+      'enquiry-logged':     config.pipeline.stages.contacted,
+      'not-interested':     config.pipeline.stages.notInterested,
+      'dnc':                config.pipeline.stages.dnc,
+      'no-answer':          config.pipeline.stages.outboundDialled,
+    };
+    const targetStage = stageMap[outcome];
+    if (targetStage) {
+      try {
+        await ghl.upsertOpportunityStage({
+          contactId,
+          pipelineId: config.pipeline.id,
+          stageId: targetStage,
+          name: `Cold Call Lead`,
+        });
+        console.log(`[ghl] ✅ opportunity stage -> ${outcome}`);
+      } catch (err) {
+        console.error(`[ghl] ❌ opportunity stage update FAILED:`, err.response?.data || err.message);
+      }
+    }
+  }
+
+  if (outcome === 'callback-requested' || outcome === 'demo-booked') {
+    const sd2 = extractStructured(vapiReport);
+    const rawTime = sd2.demo_time || sd2.callback_time || '';
+    const parsedIso = rawTime ? parseDemoTime(rawTime, vapiReport.startedAt || vapiReport.call?.startedAt) : null;
+    const dueIso = parsedIso || new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+    const title = outcome === 'demo-booked'
+      ? `🎯 Demo booked by AI — call lead to confirm${rawTime ? ` (${rawTime})` : ''}`
+      : `Callback requested${rawTime ? ` — ${rawTime}` : ''}`;
     try {
       await ghl.createTask(contactId, {
-        title: 'Callback requested by lead',
-        body: 'AI cold call resulted in callback request. See latest note.',
-        dueDate: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+        title,
+        body: outcome === 'demo-booked'
+          ? `AI booked a demo with this lead. Their requested time: "${rawTime}". Phone-based follow-up — see latest note for full context + recording.`
+          : `AI cold call resulted in callback request. See latest note.`,
+        dueDate: dueIso,
       });
-      console.log(`[ghl] ✅ callback task created`);
+      console.log(`[ghl] ✅ follow-up task created (due ${dueIso})`);
     } catch (err) {
       console.error(`[ghl] ❌ task FAILED:`, err.response?.data || err.message);
     }

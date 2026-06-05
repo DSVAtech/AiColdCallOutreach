@@ -13,21 +13,38 @@ const config = {
     apiBase: 'https://api.vapi.ai',
     assistantId: process.env.vapiassistantid || null,
     phoneNumberId: process.env.vapiphonenumberid || null,
+    structuredOutputId: process.env.structuredoutputid || null,
   },
   calling: {
     timezoneDefault: 'Australia/Sydney',
     hourStart: 9,
     hourEnd: 20,
     maxNoAnswerRetries: 3,
+    spacingSeconds: parseInt(process.env.callspacingseconds || '60', 10),
+    maxConcurrent: parseInt(process.env.maxconcurrentcalls || '1', 10),
+    dailyLimit: parseInt(process.env.dailycalllimit || '2', 10),
   },
   tags: {
     queue: process.env.queuetag || 'testingcoldcall',
+    productionQueue: 'sms-no-response',
     hotLead: 'hot-lead',
     callback: 'callback-requested',
     notInterested: 'not-interested',
     noAnswer: 'no-answer',
     dnc: 'dnc',
     enquiry: 'enquiry-logged',
+  },
+  pipeline: {
+    id: process.env.pipelineid || null,
+    stages: {
+      outboundDialled: process.env.stageOutboundDialled || null,
+      contacted: process.env.stageContacted || null,
+      warmLead: process.env.stageWarmLead || null,
+      hotLead: process.env.stageHotLead || null,
+      demoBooked: process.env.stageDemoBooked || null,
+      notInterested: process.env.stageNotInterested || null,
+      dnc: process.env.stageDnc || null,
+    },
   },
 };
 

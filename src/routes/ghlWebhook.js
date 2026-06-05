@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { triggerCallForContact } = require('../controllers/callController');
+const { enqueue, getStatus } = require('../utils/callQueue');
 
 router.post('/', async (req, res) => {
   const body = req.body || {};
@@ -12,13 +13,12 @@ router.post('/', async (req, res) => {
     return res.status(400).json({ error: 'missing contactId' });
   }
 
-  res.status(202).json({ accepted: true, contactId });
+  enqueue(contactId, () => triggerCallForContact(contactId));
+  res.status(202).json({ accepted: true, contactId, queue: getStatus() });
+});
 
-  try {
-    await triggerCallForContact(contactId);
-  } catch (err) {
-    console.error('[ghl-webhook] trigger error:', err.response?.data || err.message);
-  }
+router.get('/status', (req, res) => {
+  res.json(getStatus());
 });
 
 module.exports = router;
