@@ -11,7 +11,7 @@ const state = {
   processing: false,
 };
 
-const MAX_CALL_DURATION_MS = 10 * 60 * 1000;
+const MAX_CALL_DURATION_MS = 5 * 60 * 1000;
 
 function currentDateAEST() {
   return DateTime.now().setZone(config.calling.timezoneDefault).toFormat('yyyy-LL-dd');
