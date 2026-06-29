@@ -34,6 +34,8 @@ const config = {
     dnc: 'dnc',
     enquiry: 'enquiry-logged',
     coldCallDone: 'coldcalldone',
+    noAnswerRetry: 'no-answer-retry',
+    noAnswerFinal: 'no-answer-final',
   },
   n8n: {
     doneWebhookUrl: process.env.n8ndonewebhookurl || null,

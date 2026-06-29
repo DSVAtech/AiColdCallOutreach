@@ -220,7 +220,21 @@ async function handleCallOutcome(vapiReport) {
   const sd = extractStructured(vapiReport);
   console.log('[outcome] structured data extracted:', JSON.stringify(sd));
 
-  const outcome = classifyOutcome(vapiReport);
+  let outcome = classifyOutcome(vapiReport);
+
+  // Double-dial logic: if no-answer AND already tagged for retry, this is attempt 2 → final
+  let isNoAnswerFinal = false;
+  if (outcome === 'no-answer') {
+    const existingContact = await ghl.getContact(contactId).catch(() => null);
+    const existingTags = existingContact?.tags || [];
+    if (existingTags.includes(config.tags.noAnswerRetry)) {
+      isNoAnswerFinal = true;
+      console.log(`[outcome] no-answer attempt 2 (retry exhausted) — closing as no-answer-final`);
+    } else {
+      console.log(`[outcome] no-answer attempt 1 — will be retried in 30 min via GHL workflow`);
+    }
+  }
+
   const note = buildNote(vapiReport, outcome);
 
   console.log(`[ghl] writing note to contact ${contactId}...`);
@@ -232,16 +246,25 @@ async function handleCallOutcome(vapiReport) {
   }
 
   const { tags } = config;
-  const tagPlan = {
-    'hot-lead':           { add: [tags.hotLead, tags.coldCallDone],       remove: [tags.queue] },
-    'warm-lead':          { add: ['warm-lead', tags.coldCallDone],        remove: [tags.queue] },
-    'demo-booked':        { add: ['demo-booked', 'awaiting-boss-followup', tags.coldCallDone], remove: [tags.queue] },
-    'callback-requested': { add: [tags.callback, tags.coldCallDone],      remove: [tags.queue] },
-    'not-interested':     { add: [tags.notInterested, tags.coldCallDone], remove: [tags.queue] },
-    'no-answer':          { add: [tags.noAnswer],                         remove: [] },
-    'dnc':                { add: [tags.dnc, tags.coldCallDone],           remove: [tags.queue, tags.noAnswer, tags.callback] },
-    'enquiry-logged':     { add: [tags.enquiry, tags.coldCallDone],       remove: [tags.queue] },
-  }[outcome] || { add: [tags.enquiry, tags.coldCallDone], remove: [tags.queue] };
+  let tagPlan;
+  if (outcome === 'no-answer' && isNoAnswerFinal) {
+    // Attempt 2 missed — give up. Drop retry tag + queue, mark final + done.
+    tagPlan = { add: [tags.noAnswerFinal, tags.coldCallDone], remove: [tags.noAnswerRetry, tags.queue, tags.productionQueue] };
+  } else if (outcome === 'no-answer') {
+    // Attempt 1 missed — flag for retry. GHL workflow re-adds queue tag after 30 min.
+    tagPlan = { add: [tags.noAnswer, tags.noAnswerRetry], remove: [tags.queue, tags.productionQueue] };
+  } else {
+    // Reached the lead — clear any pending retry flag along with the normal tag changes
+    tagPlan = {
+      'hot-lead':           { add: [tags.hotLead, tags.coldCallDone],       remove: [tags.queue, tags.productionQueue, tags.noAnswerRetry] },
+      'warm-lead':          { add: ['warm-lead', tags.coldCallDone],        remove: [tags.queue, tags.productionQueue, tags.noAnswerRetry] },
+      'demo-booked':        { add: ['demo-booked', 'awaiting-boss-followup', tags.coldCallDone], remove: [tags.queue, tags.productionQueue, tags.noAnswerRetry] },
+      'callback-requested': { add: [tags.callback, tags.coldCallDone],      remove: [tags.queue, tags.productionQueue, tags.noAnswerRetry] },
+      'not-interested':     { add: [tags.notInterested, tags.coldCallDone], remove: [tags.queue, tags.productionQueue, tags.noAnswerRetry] },
+      'dnc':                { add: [tags.dnc, tags.coldCallDone],           remove: [tags.queue, tags.productionQueue, tags.noAnswer, tags.callback, tags.noAnswerRetry] },
+      'enquiry-logged':     { add: [tags.enquiry, tags.coldCallDone],       remove: [tags.queue, tags.productionQueue, tags.noAnswerRetry] },
+    }[outcome] || { add: [tags.enquiry, tags.coldCallDone], remove: [tags.queue, tags.productionQueue, tags.noAnswerRetry] };
+  }
 
   if (tagPlan.add.length) {
     try {
@@ -271,7 +294,7 @@ async function handleCallOutcome(vapiReport) {
       'dnc':                config.pipeline.stages.dnc,
       'no-answer':          config.pipeline.stages.outboundDialled,
     };
-    const targetStage = stageMap[outcome];
+    const targetStage = isNoAnswerFinal ? config.pipeline.stages.notInterested : stageMap[outcome];
     if (targetStage) {
       try {
         await ghl.upsertOpportunityStage({
@@ -320,13 +343,14 @@ async function handleCallOutcome(vapiReport) {
     const recordingUrl = vapiReport.recordingUrl || vapiReport.call?.recordingUrl || vapiReport.stereoRecordingUrl || null;
     const analysisSummary = (vapiReport.analysis || vapiReport.call?.analysis || {}).summary || null;
 
+    const reportedOutcome = isNoAnswerFinal ? 'no-answer-final' : outcome;
     await n8n.notifyCallDone({
       contact_id: contactId,
       first_name: pickFirstName(contact) || '',
       full_name: pickName(contact) || '',
       phone: pickPhone(contact) || '',
       tags: (contact?.tags || []).join(', '),
-      outcome,
+      outcome: reportedOutcome,
       sentiment: sd.sentiment || null,
       summary: analysisSummary,
       duration_seconds: durationSec,
@@ -341,8 +365,9 @@ async function handleCallOutcome(vapiReport) {
     console.error('[n8n] notify build FAILED:', err.message);
   }
 
-  console.log(`[outcome] Contact ${contactId} -> ${outcome}`);
-  return { contactId, outcome };
+  const finalOutcome = isNoAnswerFinal ? 'no-answer-final' : outcome;
+  console.log(`[outcome] Contact ${contactId} -> ${finalOutcome}`);
+  return { contactId, outcome: finalOutcome };
 }
 
 module.exports = { triggerCallForContact, handleCallOutcome, classifyOutcome };
