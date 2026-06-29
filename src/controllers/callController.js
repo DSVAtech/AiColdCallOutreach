@@ -128,6 +128,9 @@ function classifyOutcome(vapiReport) {
   if (/maybe|might be|think about|consider|send (me )?(info|details|email)/.test(summary)) return 'warm-lead';
   if (/enquir|question|ask about/.test(summary)) return 'enquiry-logged';
 
+  // No summary means person answered and immediately hung up — retry like a no-answer
+  if (!summary) return 'no-answer';
+
   return 'warm-lead';
 }
 
